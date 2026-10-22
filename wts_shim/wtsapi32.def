@@ -1,0 +1,10 @@
+LIBRARY wtsapi32.dll
+EXPORTS
+    WTSFreeMemory
+    WTSQuerySessionInformationA
+    WTSQuerySessionInformationW
+    WTSQueryUserToken
+    WTSRegisterSessionNotification
+    WTSRegisterSessionNotificationEx
+    WTSUnRegisterSessionNotification
+    WTSUnRegisterSessionNotificationEx

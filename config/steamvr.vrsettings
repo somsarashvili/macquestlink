@@ -1,0 +1,18 @@
+{
+   "dashboard" : {
+      "showDesktop" : false,
+      "useNewDesktop" : false
+   },
+   "driver_vrlink" : {
+      "10bit" : false,
+      "showAdvancedGraphs" : false
+   },
+   "steamvr" : {
+      "allowInterleavedReprojection" : false,
+      "enableHomeApp" : false,
+      "motionSmoothing" : false,
+      "preferredRefreshRate" : 72,
+      "supersampleManualOverride" : true,
+      "supersampleScale" : 1.0
+   }
+}

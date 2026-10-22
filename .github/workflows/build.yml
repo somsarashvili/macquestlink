@@ -1,0 +1,216 @@
+name: build
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  HOMEBREW_NO_AUTO_UPDATE: 1
+  HOMEBREW_NO_INSTALL_CLEANUP: 1
+  HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install zsh
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq zsh
+      - name: Script syntax (zsh -n)
+        run: for f in scripts/*.sh; do zsh -n "$f"; done
+      - name: Python syntax
+        run: python3 -m py_compile tools/*.py
+
+  build:
+    # Apple Silicon runner, same image as DXMT's upstream CI: Xcode 16 / macOS 15 SDK for DXMT's Metal code, Rosetta
+    # for the x86_64 LLVM and meson's x86_64 native toolchain, and the helper is built natively for arm64.
+    runs-on: macos-15
+    timeout-minutes: 300
+    outputs:
+      name: ${{ steps.package.outputs.name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install toolchain
+        run: |
+          brew install mingw-w64 meson ninja
+          command -v cmake >/dev/null || brew install cmake
+          /usr/bin/arch -x86_64 /usr/bin/true 2>/dev/null || sudo softwareupdate --install-rosetta --agree-to-license
+          xcodebuild -version
+          x86_64-w64-mingw32-gcc --version | head -1
+          echo "meson $(meson --version), ninja $(ninja --version), $(cmake --version | head -1)"
+
+      - name: Cache keys
+        id: keys
+        run: |
+          f=scripts/fetch-deps.sh
+          llvm_tag=$(sed -n 's/^LLVM_TAG=//p' $f)
+          llvm_flags=$(awk '/cmake -B/,/LLVM_INCLUDE_BENCHMARKS/' $f | shasum | cut -c1-12)
+          wine=$(sed -n 's/^WINE_URL=//p' $f | shasum | cut -c1-12)
+          sources=$(grep -E '^[A-Z]+_(URL|COMMIT)=' $f | shasum | cut -c1-12)
+          {
+            echo "llvm=llvm-$llvm_tag-x86_64-darwin-$llvm_flags"
+            echo "wine=wine-$wine"
+            echo "sources=sources-$sources"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Restore LLVM
+        id: llvm
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: toolchains/llvm
+          key: ${{ steps.keys.outputs.llvm }}
+      - name: Restore Wine
+        id: wine
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: toolchains/wine
+          key: ${{ steps.keys.outputs.wine }}
+      - name: Restore sources
+        id: sources
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: third_party
+          key: ${{ steps.keys.outputs.sources }}
+
+      - name: Fetch dependencies
+        run: scripts/fetch-deps.sh
+
+      # Saved right away (not in a post step) so a later build failure still keeps the slow LLVM build.
+      - name: Save LLVM
+        if: steps.llvm.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: toolchains/llvm
+          key: ${{ steps.keys.outputs.llvm }}
+      - name: Save Wine
+        if: steps.wine.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: toolchains/wine
+          key: ${{ steps.keys.outputs.wine }}
+      - name: Save sources
+        if: steps.sources.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: third_party
+          key: ${{ steps.keys.outputs.sources }}
+
+      - name: Patch and build DXMT
+        run: scripts/dxmt-patch.sh build
+
+      - name: Build shim, wtsapi32, helper
+        run: scripts/build.sh
+
+      - name: Build tools
+        run: scripts/build.sh tools
+
+      - name: Package
+        id: package
+        run: |
+          if [[ $GITHUB_REF_TYPE == tag ]]; then version=$GITHUB_REF_NAME; else version=$(git describe --tags --always); fi
+          scripts/package.sh "$version"
+          echo "name=macquestlink-$version" >> "$GITHUB_OUTPUT"
+
+      - name: Sanity checks
+        env:
+          NAME: ${{ steps.package.outputs.name }}
+        run: |
+          (cd dist && shasum -a 256 -c "$NAME.tar.gz.sha256")
+          mkdir -p "$RUNNER_TEMP/unpacked"
+          tar -xzf "dist/$NAME.tar.gz" -C "$RUNNER_TEMP/unpacked"
+          rel=$RUNNER_TEMP/unpacked/$NAME
+          echo "REL=$rel" >> "$GITHUB_ENV"
+          cd "$rel"
+          find . -type f | sort
+          fail() { echo "::error::$*"; exit 1; }
+          for f in build/dxmt/{d3d11,dxgi,d3d10core}.dll build/nvEncodeAPI64.dll build/wtsapi32.dll build/tools/*.exe build/tools/openvr_api.dll; do
+            t=$(file -b "$f"); echo "$f: $t"
+            [[ $t == "PE32+ executable (DLL)"*x86-64* || $t == "PE32+ executable (console)"*x86-64* ]] || fail "$f is not an x86_64 PE"
+          done
+          for f in build/macquestlink-encoder build/tools/{mkaudiodev,macthreads,encoder_test,vtbench}; do
+            t=$(file -b "$f"); echo "$f: $t"
+            [[ $t == "Mach-O 64-bit executable arm64" ]] || fail "$f is not an arm64 Mach-O executable"
+          done
+          exports() { x86_64-w64-mingw32-objdump -p "$1" | sed -n '/Ordinal\/Name Pointer/,/^$/p'; }
+          exports build/nvEncodeAPI64.dll | grep -q NvEncodeAPICreateInstance || fail "nvEncodeAPI64.dll export missing"
+          exports build/wtsapi32.dll | grep -q WTSQuerySessionInformationW || fail "wtsapi32.dll export missing"
+          exports build/dxmt/d3d11.dll | grep -q D3D11CreateDevice || fail "d3d11.dll export missing"
+          exports build/dxmt/dxgi.dll | grep -q CreateDXGIFactory || fail "dxgi.dll export missing"
+          for f in build/dxmt/*.dll build/nvEncodeAPI64.dll build/wtsapi32.dll; do
+            if x86_64-w64-mingw32-objdump -p "$f" | grep -iE 'DLL Name: (libgcc|libwinpthread|libstdc)'; then fail "$f needs mingw runtime DLLs"; fi
+          done
+          otool -L build/macquestlink-encoder
+
+      # Starts, maps frames.bin and listens; needs no GPU or encoder.
+      - name: Helper smoke test
+        run: |
+          d=$RUNNER_TEMP/helper; mkdir -p "$d"
+          MQL_PORT=47899 "$REL/build/macquestlink-encoder" "$d/frames.bin" & pid=$!
+          for _ in $(seq 50); do grep -q listening "$d/encoder.log" 2>/dev/null && break; sleep 0.2; done
+          kill $pid || true
+          cat "$d/encoder.log"
+          grep -q listening "$d/encoder.log"
+          ls -l "$d/frames.bin"
+
+      # Hosted runners are VMs; a hardware HEVC encoder may not be available, so this one only informs.
+      - name: VideoToolbox round trip (informational)
+        continue-on-error: true
+        run: |
+          d=$RUNNER_TEMP/vt; mkdir -p "$d"
+          export MQL_PORT=47898
+          "$REL/build/macquestlink-encoder" "$d/frames.bin" & pid=$!
+          for _ in $(seq 50); do grep -q listening "$d/encoder.log" 2>/dev/null && break; sleep 0.2; done
+          rc=0; perl -e 'alarm 120; exec @ARGV' "$REL/build/tools/encoder_test" "$d/frames.bin" | tee "$d/out.txt" || rc=$?
+          kill $pid || true
+          cat "$d/encoder.log"
+          [[ $rc == 0 ]] && grep -q 'failed 0$' "$d/out.txt"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: |
+            dist/${{ steps.package.outputs.name }}.tar.gz
+            dist/${{ steps.package.outputs.name }}.tar.gz.sha256
+          if-no-files-found: error
+          compression-level: 0
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ needs.build.outputs.name }}
+          path: dist
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pre=(); [[ $GITHUB_REF_NAME == *-* ]] && pre=(--prerelease)
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "$GITHUB_REF_NAME" --generate-notes "${pre[@]}"

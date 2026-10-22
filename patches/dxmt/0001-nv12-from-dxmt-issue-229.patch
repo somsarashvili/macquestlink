@@ -1,0 +1,1003 @@
+NV12 texture support from DXMT issue #229 (https://github.com/3Shain/dxmt/issues/229, author hadykachmarv-coder),
+rebased onto 50102f9; desktop-HWND swapchain part left out.
+
+diff --git a/src/d3d11/d3d11_context_def.cpp b/src/d3d11/d3d11_context_def.cpp
+index 9e9b816..4f5c23a 100644
+--- a/src/d3d11/d3d11_context_def.cpp
++++ b/src/d3d11/d3d11_context_def.cpp
+@@ -147,6 +147,8 @@ public:
+   STDMETHODCALLTYPE
+   Map(ID3D11Resource *pResource, UINT Subresource, D3D11_MAP MapType, UINT MapFlags,
+       D3D11_MAPPED_SUBRESOURCE *pMappedResource) override {
++    if (!pResource || !pMappedResource || !ValidateNV12Map(pResource, Subresource, MapType))
++      return E_INVALIDARG;
+     UINT buffer_length = 0, &row_pitch = buffer_length;
+     UINT bind_flag = 0, &depth_pitch = bind_flag;
+     if (unlikely(!pResource))
+@@ -257,8 +259,9 @@ public:
+             stage.SRVs.set_dirty();
+         }
+         pMappedResource->pData = MapDynamicBuffer(dynamic);
++        pMappedResource->pData = ptr_add(pMappedResource->pData, size_t(NV12MapRows(pResource, Subresource)) * row_pitch);
+         pMappedResource->RowPitch = row_pitch;
+-        pMappedResource->DepthPitch = depth_pitch;
++        pMappedResource->DepthPitch = depth_pitch - NV12MapRows(pResource, Subresource) * row_pitch;
+         break;
+       }
+       }
+diff --git a/src/d3d11/d3d11_context_imm.cpp b/src/d3d11/d3d11_context_imm.cpp
+index 4862ce7..673ce28 100644
+--- a/src/d3d11/d3d11_context_imm.cpp
++++ b/src/d3d11/d3d11_context_imm.cpp
+@@ -139,7 +139,7 @@ public:
+       D3D11_MAPPED_SUBRESOURCE *pMappedResource) override {
+     std::lock_guard<d3d11_device_mutex> lock(mutex);
+ 
+-    if (unlikely(!pResource))
++    if (unlikely(!pResource || !ValidateNV12Map(pResource, Subresource, MapType)))
+       return E_INVALIDARG;
+     UINT buffer_length = 0, &row_pitch = buffer_length;
+     UINT bind_flag = 0, &depth_pitch = bind_flag;
+@@ -197,8 +197,9 @@ public:
+         }
+ 
+         pMappedResource->pData = MapDynamicBuffer(dynamic, current_seq_id, coherent_seq_id);
++        pMappedResource->pData = ptr_add(pMappedResource->pData, size_t(NV12MapRows(pResource, Subresource)) * row_pitch);
+         pMappedResource->RowPitch = row_pitch;
+-        pMappedResource->DepthPitch = depth_pitch;
++        pMappedResource->DepthPitch = depth_pitch - NV12MapRows(pResource, Subresource) * row_pitch;
+         break;
+       }
+       }
+@@ -264,9 +265,9 @@ public:
+         }
+         if (result == StagingMapResult::Mappable) {
+           TRACE("staging map ready");
+-          pMappedResource->pData = staging->mappedImmediateMemory();
++          pMappedResource->pData = ptr_add(staging->mappedImmediateMemory(), size_t(NV12MapRows(pResource, Subresource)) * staging->bytesPerRow);
+           pMappedResource->RowPitch = staging->bytesPerRow;
+-          pMappedResource->DepthPitch = staging->bytesPerImage;
++          pMappedResource->DepthPitch = staging->bytesPerImage - NV12MapRows(pResource, Subresource) * staging->bytesPerRow;
+           return S_OK;
+         }
+         if (MapFlags & D3D11_MAP_FLAG_DO_NOT_WAIT) {
+diff --git a/src/d3d11/d3d11_context_impl.cpp b/src/d3d11/d3d11_context_impl.cpp
+index c3db7c2..06e8a11 100644
+--- a/src/d3d11/d3d11_context_impl.cpp
++++ b/src/d3d11/d3d11_context_impl.cpp
+@@ -322,6 +322,9 @@ public:
+   MTL_DXGI_FORMAT_DESC DstFormat;
+ 
+   bool DimensionIncompatible;
++  bool NV12 = false;
++  unsigned Plane = 0;
++  unsigned SrcPlaneRows = 0, DstPlaneRows = 0;
+   bool Invalid = true;
+ 
+   TextureCopyCommand(
+@@ -427,6 +430,34 @@ public:
+     }
+     }
+ 
++    if ((SrcFormat.Flag | DstFormat.Flag) & MTL_DXGI_FORMAT_NV12) {
++      if (Src.Format != DXGI_FORMAT_NV12 || Dst.Format != DXGI_FORMAT_NV12 ||
++          SrcSubresource >= 2 * Src_.Texture2DDesc.ArraySize ||
++          DstSubresource >= 2 * Dst_.Texture2DDesc.ArraySize ||
++          SrcSubresource / Src_.Texture2DDesc.ArraySize != DstSubresource / Dst_.Texture2DDesc.ArraySize)
++        return;
++      NV12 = true;
++      Plane = SrcSubresource / Src_.Texture2DDesc.ArraySize;
++      Src.ArraySlice %= Src_.Texture2DDesc.ArraySize;
++      Dst.ArraySlice %= Dst_.Texture2DDesc.ArraySize;
++      SrcPlaneRows = Src.Height;
++      DstPlaneRows = Dst.Height;
++      if (Plane) {
++        Src.Width /= 2;
++        Src.Height /= 2;
++        Dst.Width /= 2;
++        Dst.Height /= 2;
++        SrcFormat.BytesPerTexel = DstFormat.BytesPerTexel = 2;
++      } else if ((DstX | DstY | (pSrcBox ? pSrcBox->left | pSrcBox->top | pSrcBox->right | pSrcBox->bottom : 0)) & 1) {
++        return;
++      }
++      if (pSrcBox && (pSrcBox->right > Src.Width || pSrcBox->bottom > Src.Height ||
++                      pSrcBox->front || pSrcBox->back != 1))
++        return;
++      if (DstZ)
++        return;
++    }
++
+     D3D11_BOX SrcBox;
+ 
+     if (pSrcBox) {
+@@ -495,6 +526,9 @@ public:
+ 
+   MTL_DXGI_FORMAT_DESC DstFormat;
+ 
++  bool NV12 = false;
++  unsigned Plane = 0;
++  unsigned PlaneRows = 0;
+   bool Invalid = true;
+ 
+   TextureUpdateCommand(BlitObject &Dst_, UINT DstSubresource, const D3D11_BOX *pDstBox) :
+@@ -526,7 +560,7 @@ public:
+     case D3D11_RESOURCE_DIMENSION_TEXTURE2D: {
+       D3D11_TEXTURE2D_DESC1 dst_desc = Dst_.Texture2DDesc;
+ 
+-      if (DstSubresource >= dst_desc.MipLevels * dst_desc.ArraySize)
++      if (DstSubresource >= dst_desc.MipLevels * dst_desc.ArraySize * (dst_desc.Format == DXGI_FORMAT_NV12 ? 2 : 1))
+         return;
+ 
+       Dst.Format = dst_desc.Format;
+@@ -553,6 +587,23 @@ public:
+     }
+     }
+ 
++    if (Dst.Format == DXGI_FORMAT_NV12) {
++      NV12 = true;
++      Plane = DstSubresource / Dst_.Texture2DDesc.ArraySize;
++      Dst.ArraySlice %= Dst_.Texture2DDesc.ArraySize;
++      PlaneRows = Dst.Height;
++      if (Plane) {
++        Dst.Width /= 2;
++        Dst.Height /= 2;
++        DstFormat.BytesPerTexel = 2;
++      } else if (pDstBox && ((pDstBox->left | pDstBox->top | pDstBox->right | pDstBox->bottom) & 1)) {
++        return;
++      }
++      if (pDstBox && (pDstBox->right > Dst.Width || pDstBox->bottom > Dst.Height ||
++                      pDstBox->front || pDstBox->back != 1))
++        return;
++    }
++
+     D3D11_BOX DstBox;
+ 
+     if (pDstBox) {
+@@ -1058,6 +1109,13 @@ public:
+     BlitObject Dst(device, pDstResource);
+     BlitObject Src(device, pSrcResource);
+ 
++    if (Dst.Dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D && Dst.Texture2DDesc.Format == DXGI_FORMAT_NV12) {
++      if (Src.Dimension != Dst.Dimension || Src.Texture2DDesc.Format != DXGI_FORMAT_NV12 ||
++          Src.Texture2DDesc.Width != Dst.Texture2DDesc.Width || Src.Texture2DDesc.Height != Dst.Texture2DDesc.Height ||
++          Src.Texture2DDesc.ArraySize != Dst.Texture2DDesc.ArraySize)
++        return;
++    }
++
+     switch (Dst.Dimension) {
+     case D3D11_RESOURCE_DIMENSION_UNKNOWN:
+       break;
+@@ -3911,6 +3969,19 @@ public:
+   CopyTexture(TextureCopyCommand &&cmd) {
+     if (cmd.Invalid)
+       return;
++    // D3D11 video callers transfer a contiguous Y+UV image through the logical subresource.
++    if (cmd.NV12 && !cmd.Plane) {
++      auto uv = cmd;
++      uv.Plane = 1;
++      uv.SrcOrigin.x /= 2;
++      uv.SrcOrigin.y /= 2;
++      uv.DstOrigin.x /= 2;
++      uv.DstOrigin.y /= 2;
++      uv.SrcSize.width /= 2;
++      uv.SrcSize.height /= 2;
++      uv.SrcFormat.BytesPerTexel = uv.DstFormat.BytesPerTexel = 2;
++      CopyTextureBitcast(std::move(uv));
++    }
+     if ((cmd.SrcFormat.Flag & MTL_DXGI_FORMAT_BC) != (cmd.DstFormat.Flag & MTL_DXGI_FORMAT_BC)) {
+       if (cmd.SrcFormat.Flag & MTL_DXGI_FORMAT_BC) {
+         return CopyTextureFromCompressed(std::move(cmd));
+@@ -3938,10 +4009,12 @@ public:
+           }
+           for (unsigned offset_z = 0; offset_z < cmd.SrcSize.depth; offset_z++) {
+             for (unsigned offset_y = 0; offset_y < cmd.SrcSize.height; offset_y++) {
+-              auto src_offset = (cmd.SrcOrigin.z + offset_z) * src_->bytesPerImage +
++              auto src_offset = cmd.Plane * cmd.SrcPlaneRows * src_->bytesPerRow +
++                                (cmd.SrcOrigin.z + offset_z) * src_->bytesPerImage +
+                                 (cmd.SrcOrigin.y + offset_y) * src_->bytesPerRow +
+                                 cmd.SrcOrigin.x * cmd.SrcFormat.BytesPerTexel;
+-              auto dst_offset = (cmd.DstOrigin.z + offset_z) * dst_->bytesPerImage +
++              auto dst_offset = cmd.Plane * cmd.DstPlaneRows * dst_->bytesPerRow +
++                                (cmd.DstOrigin.z + offset_z) * dst_->bytesPerImage +
+                                 (cmd.DstOrigin.y + offset_y) * dst_->bytesPerRow +
+                                 cmd.DstOrigin.x * cmd.DstFormat.BytesPerTexel;
+               auto &cmdcp = enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
+@@ -3973,9 +4046,10 @@ public:
+         UseCopyDestination(staging_dst);
+         EmitOP([src_ = std::move(src), dst_ = std::move(staging_dst),
+               cmd = std::move(cmd)](ArgumentEncodingContext &enc) {
+-          auto src = enc.access(src_, cmd.Src.MipLevel, cmd.Src.ArraySlice, ResourceAccess::Read);
++          auto src = enc.access(src_, cmd.Src.MipLevel, cmd.Src.ArraySlice, ResourceAccess::Read, cmd.Plane);
+           auto [dst, dst_offset] = enc.access(dst_->buffer(), 0, dst_->length, ResourceAccess::Write);
+-          auto offset = cmd.DstOrigin.z * dst_->bytesPerImage + cmd.DstOrigin.y * dst_->bytesPerRow +
++          auto offset = cmd.Plane * cmd.DstPlaneRows * dst_->bytesPerRow + cmd.DstOrigin.z * dst_->bytesPerImage +
++                        cmd.DstOrigin.y * dst_->bytesPerRow +
+                         cmd.DstOrigin.x * cmd.DstFormat.BytesPerTexel;
+           auto &cmd_cpbuf = enc.encodeBlitCommand<wmtcmd_blit_copy_from_texture_to_buffer>();
+           cmd_cpbuf.type = WMTBlitCommandCopyFromTextureToBuffer;
+@@ -4013,7 +4087,7 @@ public:
+         EmitOP([dst_ = std::move(dst), src_ =std::move(staging_src),
+               cmd = std::move(cmd)](ArgumentEncodingContext &enc) {
+           auto [src, src_offset] = enc.access(src_->buffer(), 0, src_->length, ResourceAccess::Read);
+-          auto dst = enc.access(dst_, cmd.Dst.MipLevel, cmd.Dst.ArraySlice, ResourceAccess::Write);
++          auto dst = enc.access(dst_, cmd.Dst.MipLevel, cmd.Dst.ArraySlice, ResourceAccess::Write, cmd.Plane);
+           uint32_t offset;
+           if (cmd.SrcFormat.Flag & MTL_DXGI_FORMAT_BC) {
+             offset = cmd.SrcOrigin.z * src_->bytesPerImage + (cmd.SrcOrigin.y >> 2) * src_->bytesPerRow +
+@@ -4025,7 +4099,7 @@ public:
+           auto &cmd_cptex = enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_texture>();
+           cmd_cptex.type = WMTBlitCommandCopyFromBufferToTexture;
+           cmd_cptex.src = src->buffer();
+-          cmd_cptex.src_offset = offset + src_offset;
++          cmd_cptex.src_offset = offset + src_offset + cmd.Plane * cmd.SrcPlaneRows * src_->bytesPerRow;
+           cmd_cptex.bytes_per_row =  src_->bytesPerRow;
+           cmd_cptex.bytes_per_image = src_->bytesPerImage;
+           cmd_cptex.size = cmd.SrcSize;
+@@ -4040,8 +4114,8 @@ public:
+         EmitOP([dst_ = std::move(dst), src_ = std::move(src), cmd = std::move(cmd)](ArgumentEncodingContext &enc) {
+           auto src_format = src_->pixelFormat();
+           auto dst_format = dst_->pixelFormat();
+-          auto src = enc.access(src_, cmd.Src.MipLevel, cmd.Src.ArraySlice, ResourceAccess::Read);
+-          auto dst = enc.access(dst_, cmd.Dst.MipLevel, cmd.Dst.ArraySlice, ResourceAccess::Write);
++          auto src = enc.access(src_, cmd.Src.MipLevel, cmd.Src.ArraySlice, ResourceAccess::Read, cmd.Plane);
++          auto dst = enc.access(dst_, cmd.Dst.MipLevel, cmd.Dst.ArraySlice, ResourceAccess::Write, cmd.Plane);
+           if (Forget_sRGB(dst_format) != Forget_sRGB(src_format) || cmd.DimensionIncompatible) {
+ 
+             // bitcast, using a temporary buffer
+@@ -4214,6 +4288,20 @@ public:
+     if (cmd.Invalid)
+       return;
+ 
++    if (cmd.NV12 && (!pSrcData || SrcRowPitch < cmd.EffectiveBytesPerRow))
++      return;
++    if (cmd.NV12 && !cmd.Plane) {
++      auto uv = cmd;
++      uv.Plane = 1;
++      uv.DstOrigin.x /= 2;
++      uv.DstOrigin.y /= 2;
++      uv.DstSize.width /= 2;
++      uv.DstSize.height /= 2;
++      uv.EffectiveRows /= 2;
++      UpdateTexture(std::move(uv), ptr_add(pSrcData, size_t(SrcRowPitch) * cmd.DstSize.height),
++                    SrcRowPitch, 0, CopyFlags);
++    }
++
+     std::lock_guard<mutex_t> lock(mutex);
+ 
+     if (auto dst = GetTexture(cmd.pDst)) {
+@@ -4237,7 +4325,7 @@ public:
+       SwitchToBlitEncoder(CommandBufferState::UpdateBlitEncoderActive);
+       EmitOP([staging_buffer, offset, dst = std::move(dst), cmd = std::move(cmd),
+             bytes_per_depth_slice](ArgumentEncodingContext &enc) {
+-        auto texture = enc.access(dst, cmd.Dst.MipLevel, cmd.Dst.ArraySlice, ResourceAccess::Write);
++        auto texture = enc.access(dst, cmd.Dst.MipLevel, cmd.Dst.ArraySlice, ResourceAccess::Write, cmd.Plane);
+         auto &cmd_cptex = enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_texture>();
+         cmd_cptex.type = WMTBlitCommandCopyFromBufferToTexture;
+         cmd_cptex.src = staging_buffer;
+@@ -4265,6 +4353,17 @@ public:
+     if (cmd.Invalid)
+       return;
+ 
++    if (cmd.NV12 && !cmd.Plane) {
++      auto uv = cmd;
++      uv.Plane = 1;
++      uv.DstOrigin.x /= 2;
++      uv.DstOrigin.y /= 2;
++      uv.DstSize.width /= 2;
++      uv.DstSize.height /= 2;
++      uv.EffectiveRows /= 2;
++      UpdateTexture(std::move(uv), Rc<Buffer>(src), SrcRowPitch, SrcDepthPitch);
++    }
++
+     std::lock_guard<mutex_t> lock(mutex);
+ 
+     if (auto dst = GetTexture(cmd.pDst)) {
+@@ -4272,11 +4371,11 @@ public:
+       SwitchToBlitEncoder(CommandBufferState::UpdateBlitEncoderActive);
+       EmitOP([=, src = std::move(src), dst = std::move(dst), cmd = std::move(cmd)](ArgumentEncodingContext &enc) {
+         auto [src_buffer, src_offset] = enc.access(src, 0, src->length(), ResourceAccess::Read);
+-        auto texture = enc.access(dst, cmd.Dst.MipLevel, cmd.Dst.ArraySlice, ResourceAccess::Write);
++        auto texture = enc.access(dst, cmd.Dst.MipLevel, cmd.Dst.ArraySlice, ResourceAccess::Write, cmd.Plane);
+         auto &cmd_cptex = enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_texture>();
+         cmd_cptex.type = WMTBlitCommandCopyFromBufferToTexture;
+         cmd_cptex.src = src_buffer->buffer();
+-        cmd_cptex.src_offset = src_offset;
++        cmd_cptex.src_offset = src_offset + size_t(cmd.Plane) * cmd.PlaneRows * SrcRowPitch;
+         cmd_cptex.bytes_per_row = SrcRowPitch;
+         cmd_cptex.bytes_per_image = SrcDepthPitch;
+         cmd_cptex.size = cmd.DstSize;
+diff --git a/src/d3d11/d3d11_device.cpp b/src/d3d11/d3d11_device.cpp
+index 62efc67..92a4ada 100644
+--- a/src/d3d11/d3d11_device.cpp
++++ b/src/d3d11/d3d11_device.cpp
+@@ -9,6 +9,7 @@
+ #include "d3d11_context.hpp"
+ #include "d3d11_context_state.hpp"
+ #include "d3d11_device.hpp"
++#include "dxmt_nv12.hpp"
+ #include "d3d11_pipeline_cache.hpp"
+ #include "d3d11_private.h"
+ #include "d3d11_query.hpp"
+@@ -165,6 +166,20 @@ public:
+     if (pDesc) {
+       D3D11_SHADER_RESOURCE_VIEW_DESC1 desc1;
+       UpgradeViewDescription(pDesc, desc1);
++      if (pResource) {
++        D3D11_RESOURCE_DIMENSION dimension;
++        pResource->GetType(&dimension);
++        if (dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
++          D3D11_TEXTURE2D_DESC textureDesc;
++          static_cast<ID3D11Texture2D *>(pResource)->GetDesc(&textureDesc);
++          if (textureDesc.Format == DXGI_FORMAT_NV12 && pDesc->Format == DXGI_FORMAT_R8G8_UNORM) {
++            if (desc1.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D)
++              desc1.Texture2D.PlaneSlice = 1;
++            else if (desc1.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DARRAY)
++              desc1.Texture2DArray.PlaneSlice = 1;
++          }
++        }
++      }
+       return CreateShaderResourceView1(pResource, &desc1,
+                                        (ID3D11ShaderResourceView1 **)ppSRView);
+     }
+@@ -465,6 +480,13 @@ public:
+       *pFormatSupport = 0;
+     }
+ 
++    if (Format == DXGI_FORMAT_NV12) {
++      if (pFormatSupport)
++        *pFormatSupport = D3D11_FORMAT_SUPPORT_TEXTURE2D | D3D11_FORMAT_SUPPORT_CPU_LOCKABLE |
++                         D3D11_FORMAT_SUPPORT_SHADER_LOAD | D3D11_FORMAT_SUPPORT_SHADER_SAMPLE;
++      return S_OK;
++    }
++
+     if (Format == DXGI_FORMAT_UNKNOWN) {
+       *pFormatSupport =
+           D3D11_FORMAT_SUPPORT_BUFFER | D3D11_FORMAT_SUPPORT_CPU_LOCKABLE;
+@@ -603,6 +625,8 @@ public:
+       if (FeatureSupportDataSize != sizeof(*info))
+         return E_INVALIDARG;
+       info->OutFormatSupport2 = 0;
++      if (info->InFormat == DXGI_FORMAT_NV12)
++        return S_OK;
+ 
+       if (info->InFormat == DXGI_FORMAT_UNKNOWN) {
+         info->OutFormatSupport2 |=
+@@ -810,6 +834,10 @@ public:
+       return E_INVALIDARG;
+     }
+     *pNumQualityLevels = 0;
++    if (Format == DXGI_FORMAT_NV12) {
++      *pNumQualityLevels = SampleCount == 1 ? 1 : 0;
++      return S_OK;
++    }
+     MTL_DXGI_FORMAT_DESC desc;
+     if (FAILED(MTLQueryDXGIFormat(GetMTLDevice(), Format, desc)) ||
+         desc.PixelFormat == WMTPixelFormatInvalid) {
+@@ -843,12 +871,33 @@ public:
+     if ((pDesc->MiscFlags & D3D11_RESOURCE_MISC_TILED))
+       return E_INVALIDARG; // not supported yet
+ 
++    if (pDesc->Format == DXGI_FORMAT_NV12) {
++      WMTTextureInfo info;
++      D3D11_TEXTURE2D_DESC1 finalDesc;
++      if (pDesc->SampleDesc.Quality || pDesc->Usage > D3D11_USAGE_STAGING ||
++          FAILED(CreateMTLTextureDescriptor(this, pDesc, &finalDesc, &info)))
++        return E_INVALIDARG;
++      if (pInitialData) {
++        for (UINT slice = 0; slice < pDesc->ArraySize; slice++) {
++          if (!pInitialData[slice].pSysMem ||
++              !NV12Layout::valid(pDesc->Width, pDesc->Height, pInitialData[slice].SysMemPitch))
++            return E_INVALIDARG;
++        }
++      } else if (pDesc->Usage == D3D11_USAGE_IMMUTABLE) {
++        return E_INVALIDARG;
++      }
++      if (!ppTexture2D)
++        return S_FALSE;
++    }
++
+     try {
+       switch (pDesc->Usage) {
+       case D3D11_USAGE_DEFAULT:
+       case D3D11_USAGE_IMMUTABLE:
+         return CreateDeviceTexture2D(this, pDesc, pInitialData, ppTexture2D);
+       case D3D11_USAGE_DYNAMIC: {
++        if (pDesc->Format == DXGI_FORMAT_NV12)
++          return CreateDynamicTexture2D(this, pDesc, pInitialData, ppTexture2D);
+         HRESULT hr = CreateDynamicLinearTexture2D(this, pDesc, pInitialData, ppTexture2D);
+         if (SUCCEEDED(hr))
+           return hr;
+diff --git a/src/d3d11/d3d11_resource.hpp b/src/d3d11/d3d11_resource.hpp
+index f5602e7..50cb5f8 100644
+--- a/src/d3d11/d3d11_resource.hpp
++++ b/src/d3d11/d3d11_resource.hpp
+@@ -171,6 +171,39 @@ inline Rc<DynamicLinearTexture>
+ GetDynamicLinearTexture(ID3D11Resource *pResource, UINT *pBytesPerRow, UINT *pBytesPerImage) {
+   return static_cast<D3D11ResourceCommon *>(pResource)->dynamicLinearTexture(pBytesPerRow, pBytesPerImage);
+ }
++inline bool
++ValidateNV12Map(ID3D11Resource *resource, UINT subresource, D3D11_MAP mapType) {
++  D3D11_RESOURCE_DIMENSION dimension;
++  resource->GetType(&dimension);
++  if (dimension != D3D11_RESOURCE_DIMENSION_TEXTURE2D)
++    return true;
++  D3D11_TEXTURE2D_DESC desc;
++  static_cast<ID3D11Texture2D *>(resource)->GetDesc(&desc);
++  if (desc.Format != DXGI_FORMAT_NV12)
++    return true;
++  if (subresource >= 2 * desc.ArraySize)
++    return false;
++  if (desc.Usage == D3D11_USAGE_DYNAMIC)
++    return mapType == D3D11_MAP_WRITE_DISCARD;
++  if (desc.Usage != D3D11_USAGE_STAGING || mapType < D3D11_MAP_READ || mapType > D3D11_MAP_READ_WRITE)
++    return false;
++  return (!(mapType & D3D11_MAP_READ) || (desc.CPUAccessFlags & D3D11_CPU_ACCESS_READ)) &&
++         (!(mapType & D3D11_MAP_WRITE) || (desc.CPUAccessFlags & D3D11_CPU_ACCESS_WRITE));
++}
++
++inline UINT
++NV12MapRows(ID3D11Resource *resource, UINT subresource) {
++  D3D11_RESOURCE_DIMENSION dimension;
++  resource->GetType(&dimension);
++  if (dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
++    D3D11_TEXTURE2D_DESC desc;
++    static_cast<ID3D11Texture2D *>(resource)->GetDesc(&desc);
++    if (desc.Format == DXGI_FORMAT_NV12 && subresource >= desc.ArraySize && subresource < 2 * desc.ArraySize)
++      return desc.Height;
++  }
++  return 0;
++}
++
+ inline Rc<DynamicBuffer>
+ GetDynamicTexture(ID3D11Resource *pResource, UINT Subresource, UINT *pBufferLength, UINT *pBindFlags) {
+   return static_cast<D3D11ResourceCommon *>(pResource)->dynamicTexture(Subresource, pBufferLength, pBindFlags);
+diff --git a/src/d3d11/d3d11_resource_helper.cpp b/src/d3d11/d3d11_resource_helper.cpp
+index 6624ed6..540abdd 100644
+--- a/src/d3d11/d3d11_resource_helper.cpp
++++ b/src/d3d11/d3d11_resource_helper.cpp
+@@ -2,6 +2,7 @@
+ #include "d3d11_private.h"
+ #include "dxmt_format.hpp"
+ #include "d3d11_resource.hpp"
++#include "dxmt_nv12.hpp"
+ #include "d3d11_1.h"
+ #include "util_math.hpp"
+ 
+@@ -306,6 +307,21 @@ CreateMTLTextureDescriptorInternal(
+   if (Width == 0 || Height == 0 || Depth == 0 || ArraySize == 0 || SampleCount == 0)
+     return E_INVALIDARG;
+ 
++  if (Format == DXGI_FORMAT_NV12) {
++    if (Dimension != D3D11_RESOURCE_DIMENSION_TEXTURE2D || !NV12Layout::valid(Width, Height, Width) ||
++        ArraySize > D3D11_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION ||
++        Width > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION || Height > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION ||
++        MipLevels > 1 || SampleCount != 1 || MiscFlags ||
++        (BindFlags & ~(D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET |
++                       D3D11_BIND_DECODER | D3D11_BIND_VIDEO_ENCODER)) ||
++        (Usage == D3D11_USAGE_DYNAMIC && CPUAccessFlags != D3D11_CPU_ACCESS_WRITE) ||
++        (Usage == D3D11_USAGE_STAGING && (!CPUAccessFlags || BindFlags ||
++         (CPUAccessFlags & ~(D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE)))) ||
++        ((Usage == D3D11_USAGE_DEFAULT || Usage == D3D11_USAGE_IMMUTABLE) && CPUAccessFlags))
++      return E_INVALIDARG;
++    MipLevels = 1;
++  }
++
+   MTL_DXGI_FORMAT_DESC metal_format;
+   if (FAILED(MTLQueryDXGIFormat(pDevice->GetMTLDevice(), Format, metal_format))) {
+     ERR("CreateMTLTextureDescriptorInternal: creating a texture of invalid "
+@@ -375,6 +391,9 @@ CreateMTLTextureDescriptorInternal(
+     metal_usage |= WMTTextureUsageRenderTarget;
+   }
+ 
++  // Media Foundation may request RT/decoder binds without creating render/video views.
++  if (Format == DXGI_FORMAT_NV12)
++    metal_usage = WMTTextureUsageShaderRead;
+   pDescOut->usage = metal_usage;
+ 
+   WMTResourceOptions options = (WMTResourceOptions)0;
+@@ -597,6 +616,15 @@ GetLinearTextureLayout(
+     MTLD3D11Device *pDevice, const D3D11_TEXTURE2D_DESC1 &Desc, uint32_t level, uint32_t &BytesPerRow,
+     uint32_t &BytesPerImage, uint32_t &BytesPerSlice, bool Aligned
+ ) {
++  if (Desc.Format == DXGI_FORMAT_NV12) {
++    uint32_t pitch = Aligned ? align(Desc.Width, 256u) : Desc.Width;
++    if (level || !NV12Layout::valid(Desc.Width, Desc.Height, pitch))
++      return E_INVALIDARG;
++    auto layout = NV12Layout::get(Desc.Height, pitch);
++    BytesPerRow = layout.pitch;
++    BytesPerImage = BytesPerSlice = layout.size;
++    return S_OK;
++  }
+   auto metal = pDevice->GetMTLDevice();
+   MTL_DXGI_FORMAT_DESC metal_format;
+ 
+diff --git a/src/d3d11/d3d11_resource_staging.cpp b/src/d3d11/d3d11_resource_staging.cpp
+index 5ba6cb3..cab2590 100644
+--- a/src/d3d11/d3d11_resource_staging.cpp
++++ b/src/d3d11/d3d11_resource_staging.cpp
+@@ -77,6 +77,11 @@ public:
+ 
+   Rc<StagingResource>
+   staging(UINT Subresource) final {
++    if (this->desc.Format == DXGI_FORMAT_NV12) {
++      if (Subresource >= 2 * subresource_count)
++        return {};
++      return subresources[Subresource % subresource_count];
++    }
+     return subresources.at(Subresource);
+   }
+   Rc<DynamicBuffer>
+@@ -126,7 +131,7 @@ HRESULT CreateStagingTextureInternal(MTLD3D11Device *pDevice,
+         for (auto row = 0u; row < (bpi / bpr); row++) {
+           auto dst_data = ptr_add(mapped, image * bpi + row * bpr);
+           auto src_data = ptr_add(pInitialData[sub.SubresourceId].pSysMem, image * bpi_read + row * bpr_read);
+-          memcpy(dst_data, src_data, std::min(bpr, bpr_read));
++          memcpy(dst_data, src_data, finalDesc.Format == DXGI_FORMAT_NV12 ? w : std::min(bpr, bpr_read));
+         }
+       }
+     }
+diff --git a/src/d3d11/d3d11_resource_view_helper.cpp b/src/d3d11/d3d11_resource_view_helper.cpp
+index eb741b5..abf53b9 100644
+--- a/src/d3d11/d3d11_resource_view_helper.cpp
++++ b/src/d3d11/d3d11_resource_view_helper.cpp
+@@ -26,6 +26,43 @@ InitializeAndNormalizeViewDescriptor(
+     MTLD3D11Device *pDevice, unsigned MiplevelCount, unsigned ArraySize, Texture* pTexture,
+     D3D11_SHADER_RESOURCE_VIEW_DESC1 &ViewDesc, TextureViewDescriptor &Descriptor
+ ) {
++  if (pTexture->nv12) {
++    UINT plane, mip, mips, first = 0, count = 1;
++    if (ViewDesc.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D) {
++      plane = ViewDesc.Texture2D.PlaneSlice;
++      mip = ViewDesc.Texture2D.MostDetailedMip;
++      mips = ViewDesc.Texture2D.MipLevels;
++      Descriptor.type = WMTTextureType2D;
++    } else if (ViewDesc.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DARRAY) {
++      plane = ViewDesc.Texture2DArray.PlaneSlice;
++      mip = ViewDesc.Texture2DArray.MostDetailedMip;
++      mips = ViewDesc.Texture2DArray.MipLevels;
++      first = ViewDesc.Texture2DArray.FirstArraySlice;
++      count = ViewDesc.Texture2DArray.ArraySize;
++      if (count == UINT(-1) && first < ArraySize)
++        count = ArraySize - first;
++      Descriptor.type = WMTTextureType2DArray;
++    } else {
++      return E_INVALIDARG;
++    }
++    if (plane > 1 || mip || (mips != 1 && mips != UINT(-1)) || !count ||
++        first >= ArraySize || count > ArraySize - first ||
++        ViewDesc.Format != (plane ? DXGI_FORMAT_R8G8_UNORM : DXGI_FORMAT_R8_UNORM))
++      return E_INVALIDARG;
++    Descriptor.format = plane ? WMTPixelFormatRG8Unorm : WMTPixelFormatR8Unorm;
++    Descriptor.plane = plane;
++    Descriptor.firstMiplevel = 0;
++    Descriptor.miplevelCount = 1;
++    Descriptor.firstArraySlice = first;
++    Descriptor.arraySize = count;
++    if (ViewDesc.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D)
++      ViewDesc.Texture2D.MipLevels = 1;
++    else {
++      ViewDesc.Texture2DArray.MipLevels = 1;
++      ViewDesc.Texture2DArray.ArraySize = count;
++    }
++    return S_OK;
++  }
+   MTL_DXGI_FORMAT_DESC metal_format;
+   if (FAILED(MTLQueryDXGIFormat(pDevice->GetMTLDevice(), ViewDesc.Format, metal_format))) {
+     ERR("Failed to create SRV due to unsupported format ", ViewDesc.Format);
+diff --git a/src/d3d11/d3d11_texture_device.cpp b/src/d3d11/d3d11_texture_device.cpp
+index 1faf496..d344526 100644
+--- a/src/d3d11/d3d11_texture_device.cpp
++++ b/src/d3d11/d3d11_texture_device.cpp
+@@ -171,6 +171,8 @@ public:
+ 
+   HRESULT STDMETHODCALLTYPE CreateRenderTargetView(const D3D11_RENDER_TARGET_VIEW_DESC1 *pDesc,
+                                  ID3D11RenderTargetView1 **ppView) override {
++    if (this->texture_->nv12)
++      return E_INVALIDARG;
+     D3D11_RENDER_TARGET_VIEW_DESC1 finalDesc;
+     if (FAILED(ExtractEntireResourceViewDescription(&this->desc, pDesc,
+                                                     &finalDesc))) {
+@@ -199,6 +201,8 @@ public:
+ 
+   HRESULT STDMETHODCALLTYPE CreateDepthStencilView(const D3D11_DEPTH_STENCIL_VIEW_DESC *pDesc,
+                                  ID3D11DepthStencilView **ppView) override {
++    if (this->texture_->nv12)
++      return E_INVALIDARG;
+     D3D11_DEPTH_STENCIL_VIEW_DESC finalDesc;
+     if (FAILED(ExtractEntireResourceViewDescription(&this->desc, pDesc,
+                                                     &finalDesc))) {
+@@ -259,6 +263,8 @@ public:
+   STDMETHODCALLTYPE
+   CreateUnorderedAccessView(const D3D11_UNORDERED_ACCESS_VIEW_DESC1 *pDesc,
+                             ID3D11UnorderedAccessView1 **ppView) override {
++    if (this->texture_->nv12)
++      return E_INVALIDARG;
+     D3D11_UNORDERED_ACCESS_VIEW_DESC1 finalDesc;
+     if (FAILED(ExtractEntireResourceViewDescription(&this->desc, pDesc,
+                                                     &finalDesc))) {
+@@ -366,7 +372,7 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
+   }
+   bool single_subresource = info.mipmap_level_count == 1 && info.array_length == 1 &&
+                             !(finalDesc.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE);
+-  auto texture = Rc<Texture>(new Texture(info, pDevice->GetMTLDevice()));
++  auto texture = Rc<Texture>(new Texture(info, pDevice->GetMTLDevice(), finalDesc.Format == DXGI_FORMAT_NV12));
+ 
+   MTL_DXGI_FORMAT_DESC format_desc;
+   MTLQueryDXGIFormat(pDevice->GetMTLDevice(), finalDesc.Format, format_desc);
+@@ -515,7 +521,7 @@ ImportSharedTextureInternal(
+   if (FAILED(CreateMTLTextureDescriptor(pDevice, pDescUnchecked, &finalDesc, &info)))
+     return E_INVALIDARG;
+ 
+-  auto texture = Rc<Texture>(new Texture(info, pDevice->GetMTLDevice()));
++  auto texture = Rc<Texture>(new Texture(info, pDevice->GetMTLDevice(), finalDesc.Format == DXGI_FORMAT_NV12));
+   auto allocation = texture->import(MachPort);
+   if (!allocation)
+     return E_FAIL;
+diff --git a/src/d3d11/d3d11_texture_dynamic.cpp b/src/d3d11/d3d11_texture_dynamic.cpp
+index da9a7cc..0ebe9c1 100644
+--- a/src/d3d11/d3d11_texture_dynamic.cpp
++++ b/src/d3d11/d3d11_texture_dynamic.cpp
+@@ -55,6 +55,8 @@ public:
+   Rc<DynamicLinearTexture> dynamicLinearTexture(UINT*, UINT*) final { return {}; };
+   Rc<DynamicBuffer> dynamicTexture(UINT subresource, UINT *bytes_per_row,
+                                    UINT *bytes_per_depth) final {
++    if (this->desc.Format == DXGI_FORMAT_NV12 && subresource < 2 * subresources_.size())
++      subresource %= subresources_.size();
+     if (subresource < subresources_.size()) {
+       auto &sub = subresources_[subresource];
+       *bytes_per_row = sub.bytes_per_row;
+@@ -135,13 +137,21 @@ HRESULT CreateDynamicTextureInternal(MTLD3D11Device *pDevice,
+     subresources.push_back(std::move(subresource));
+   }
+ 
+-  auto texture = Rc<Texture>(new Texture(info, pDevice->GetMTLDevice()));
++  auto texture = Rc<Texture>(new Texture(info, pDevice->GetMTLDevice(), finalDesc.Format == DXGI_FORMAT_NV12));
+   Flags<TextureAllocationFlag> flags;
+   flags.set(TextureAllocationFlag::GpuManaged);
+   flags.set(TextureAllocationFlag::ShaderReadonly);
+   if (pInitialData) {
+     auto default_allocation = texture->allocate(flags);
+-    InitializeTextureData(pDevice, default_allocation->texture(), finalDesc, pInitialData);
++    if (texture->nv12) {
++      for (auto sub : EnumerateSubresources(finalDesc)) {
++        const auto &data = pInitialData[sub.SubresourceId];
++        pDevice->GetDXMTDevice().queue().initializer.initWithData(
++            texture.ptr(), default_allocation.ptr(), sub.ArraySlice, 0, data.pSysMem, data.SysMemPitch, 0, 0);
++      }
++    } else {
++      InitializeTextureData(pDevice, default_allocation->texture(), finalDesc, pInitialData);
++    }
+     texture->rename(std::move(default_allocation));
+     *ppTexture =
+         reinterpret_cast<typename tag::COM_IMPL *>(
+diff --git a/src/dxmt/dxmt_context.hpp b/src/dxmt/dxmt_context.hpp
+index eabe872..175f625 100644
+--- a/src/dxmt/dxmt_context.hpp
++++ b/src/dxmt/dxmt_context.hpp
+@@ -367,7 +367,7 @@ public:
+ 
+   template<PipelineStage stage = PipelineStage::Compute>
+   WMT::Texture
+-  access(Rc<Texture> const &texture, unsigned level, unsigned slice, int flags) {
++  access(Rc<Texture> const &texture, unsigned level, unsigned slice, int flags, unsigned plane = 0) {
+     auto allocation = texture->current();
+     retainAllocation(allocation);
+     if (!allocation->flags().test(TextureAllocationFlag::GpuReadonly)) {
+@@ -378,7 +378,7 @@ public:
+         track<stage>(tracker, flags);
+       }
+     }
+-    return allocation->texture();
++    return allocation->texture(plane);
+   }
+ 
+   template<PipelineStage stage = PipelineStage::Compute>
+diff --git a/src/dxmt/dxmt_format.cpp b/src/dxmt/dxmt_format.cpp
+index 6183453..bcc5c91 100644
+--- a/src/dxmt/dxmt_format.cpp
++++ b/src/dxmt/dxmt_format.cpp
+@@ -1042,10 +1042,14 @@ MTLQueryDXGIFormat(WMT::Device device, uint32_t format, MTL_DXGI_FORMAT_DESC &de
+     description.BytesPerTexel = 2;
+     break;
+   }
++  case DXGI_FORMAT_NV12:
++    description.PixelFormat = WMTPixelFormatR8Unorm;
++    description.BytesPerTexel = 1;
++    description.Flag = MTL_DXGI_FORMAT_NV12;
++    break;
+   case DXGI_FORMAT_AYUV:
+   case DXGI_FORMAT_Y410:
+   case DXGI_FORMAT_Y416:
+-  case DXGI_FORMAT_NV12:
+   case DXGI_FORMAT_P010:
+   case DXGI_FORMAT_P016:
+   case DXGI_FORMAT_420_OPAQUE:
+diff --git a/src/dxmt/dxmt_format.hpp b/src/dxmt/dxmt_format.hpp
+index 21a4819..b401da0 100644
+--- a/src/dxmt/dxmt_format.hpp
++++ b/src/dxmt/dxmt_format.hpp
+@@ -41,6 +41,7 @@ uint32_t DepthStencilPlanarFlags(WMTPixelFormat format);
+ enum MTL_DXGI_FORMAT_FLAG {
+   MTL_DXGI_FORMAT_TYPELESS = 1,
+   MTL_DXGI_FORMAT_BC = 2,
++  MTL_DXGI_FORMAT_NV12 = 8,
+   MTL_DXGI_FORMAT_BACKBUFFER = 4,
+   MTL_DXGI_FORMAT_DEPTH_PLANER = 16,
+   MTL_DXGI_FORMAT_STENCIL_PLANER = 32,
+diff --git a/src/dxmt/dxmt_nv12.hpp b/src/dxmt/dxmt_nv12.hpp
+new file mode 100644
+index 0000000..981c96a
+--- /dev/null
++++ b/src/dxmt/dxmt_nv12.hpp
+@@ -0,0 +1,22 @@
++#pragma once
++#include <cstdint>
++#include <limits>
++
++namespace dxmt {
++
++// Both planes have the same byte pitch; UV follows all Y rows.
++struct NV12Layout {
++  uint32_t pitch;
++  uint32_t uvOffset;
++  uint32_t size;
++
++  static constexpr bool valid(uint32_t width, uint32_t height, uint32_t pitch) {
++    return width && height && !(width & 1) && !(height & 1) && pitch >= width &&
++           uint64_t(pitch) * (uint64_t(height) + height / 2) <= std::numeric_limits<uint32_t>::max();
++  }
++  static constexpr NV12Layout get(uint32_t height, uint32_t pitch) {
++    return {pitch, pitch * height, pitch * (height + height / 2)};
++  }
++};
++
++} // namespace dxmt
+diff --git a/src/dxmt/dxmt_resource_initializer.cpp b/src/dxmt/dxmt_resource_initializer.cpp
+index b961a6a..5295e9c 100644
+--- a/src/dxmt/dxmt_resource_initializer.cpp
++++ b/src/dxmt/dxmt_resource_initializer.cpp
+@@ -161,8 +161,10 @@ ResourceInitializer::initRenderTargetWithZero(
+ 
+ uint64_t
+ ResourceInitializer::initWithZero(
+-    const Texture *texture, TextureAllocation *allocation, uint32_t slice, uint32_t level
++    const Texture *texture, TextureAllocation *allocation, uint32_t slice, uint32_t level, unsigned plane
+ ) {
++  if (texture->nv12 && !plane)
++    initWithZero(texture, allocation, slice, level, 1);
+   if (auto dsv_planar = DepthStencilPlanarFlags(texture->pixelFormat())) {
+     return initDepthStencilWithZero(texture, allocation, slice, level, dsv_planar);
+   }
+@@ -170,8 +172,8 @@ ResourceInitializer::initWithZero(
+     return initRenderTargetWithZero(texture, allocation, slice, level);
+   }
+ 
+-  auto width_sub = std::max(1u, texture->width() >> level);
+-  auto height_sub = std::max(1u, texture->height() >> level);
++  auto width_sub = std::max(1u, texture->width() >> (level + plane));
++  auto height_sub = std::max(1u, texture->height() >> (level + plane));
+   auto depth_sub = std::max(1u, texture->depth() >> level);
+ 
+   auto block_size = 1u;
+@@ -198,7 +200,7 @@ ResourceInitializer::initWithZero(
+   }
+ 
+   bool is_3d_tex = texture->textureType() == WMTTextureType3D;
+-  size_t texel_size = MTLGetTexelSize(texture->pixelFormat());
++  size_t texel_size = MTLGetTexelSize(plane ? WMTPixelFormatRG8Unorm : texture->pixelFormat());
+   size_t bytes_per_row_needed = texel_size * align(width_sub, block_size) / block_size;
+   size_t bytes_per_image_needed = bytes_per_row_needed * align(height_sub, block_size) / block_size;
+   size_t total_bytes_needed = bytes_per_image_needed * depth_sub;
+@@ -216,7 +218,7 @@ ResourceInitializer::initWithZero(
+     copy->bytes_per_row = bytes_per_row_needed;
+     copy->bytes_per_image = is_3d_tex ? bytes_per_image_needed : 0;
+     copy->size = {width_sub, height_sub, depth_sub};
+-    copy->dst = allocation->texture();
++    copy->dst = allocation->texture(plane);
+     copy->slice = slice;
+     copy->level = level;
+     copy->origin = {0, 0, 0};
+@@ -229,10 +231,12 @@ ResourceInitializer::initWithZero(
+ uint64_t
+ ResourceInitializer::initWithData(
+     const Texture *texture, TextureAllocation *allocation, uint32_t slice, uint32_t level, const void *data,
+-    size_t row_pitch, size_t depth_pitch, uint32_t format_flags
++    size_t row_pitch, size_t depth_pitch, uint32_t format_flags, unsigned plane
+ ) {
+-  auto width_sub = std::max(1u, texture->width() >> level);
+-  auto height_sub = std::max(1u, texture->height() >> level);
++  if (texture->nv12 && !plane)
++    initWithData(texture, allocation, slice, level, ptr_add(data, row_pitch * texture->height()), row_pitch, 0, 0, 1);
++  auto width_sub = std::max(1u, texture->width() >> (level + plane));
++  auto height_sub = std::max(1u, texture->height() >> (level + plane));
+   auto depth_sub = std::max(1u, texture->depth() >> level);
+ 
+   auto block_size = 1u;
+@@ -264,7 +268,7 @@ ResourceInitializer::initWithData(
+ 
+   bool is_1d_tex = (texture->textureType() == WMTTextureType1D) || (texture->textureType() == WMTTextureType1DArray);
+   bool is_3d_tex = texture->textureType() == WMTTextureType3D;
+-  size_t texel_size = MTLGetTexelSize(texture->pixelFormat());
++  size_t texel_size = MTLGetTexelSize(plane ? WMTPixelFormatRG8Unorm : texture->pixelFormat());
+   size_t bytes_per_row_needed = texel_size * align(width_sub, block_size) / block_size;
+   size_t bytes_per_row_increment = is_1d_tex ? bytes_per_row_needed : row_pitch;
+   size_t bytes_per_row_valid = is_1d_tex ? bytes_per_row_needed : std::min(row_pitch, bytes_per_row_needed);
+@@ -301,7 +305,7 @@ ResourceInitializer::initWithData(
+     copy->bytes_per_row = bytes_per_row_needed;
+     copy->bytes_per_image = is_3d_tex ? bytes_per_image_needed : 0;
+     copy->size = {width_sub, height_sub, depth_sub};
+-    copy->dst = allocation->texture();
++    copy->dst = allocation->texture(plane);
+     copy->slice = slice;
+     copy->level = level;
+     copy->origin = {0, 0, 0};
+diff --git a/src/dxmt/dxmt_resource_initializer.hpp b/src/dxmt/dxmt_resource_initializer.hpp
+index 187df0b..ad7adae 100644
+--- a/src/dxmt/dxmt_resource_initializer.hpp
++++ b/src/dxmt/dxmt_resource_initializer.hpp
+@@ -44,10 +44,12 @@ public:
+   );
+   uint64_t
+   initRenderTargetWithZero(const Texture *texture, TextureAllocation *allocation, uint32_t slice, uint32_t level);
+-  uint64_t initWithZero(const Texture *texture, TextureAllocation *allocation, uint32_t slice, uint32_t level);
++  uint64_t initWithZero(
++      const Texture *texture, TextureAllocation *allocation, uint32_t slice, uint32_t level, unsigned plane = 0
++  );
+   uint64_t initWithData(
+       const Texture *texture, TextureAllocation *allocation, uint32_t slice, uint32_t level, const void *data,
+-      size_t row_pitch, size_t depth_pitch, uint32_t format_flags
++      size_t row_pitch, size_t depth_pitch, uint32_t format_flags, unsigned plane = 0
+   );
+ 
+   /*
+diff --git a/src/dxmt/dxmt_texture.cpp b/src/dxmt/dxmt_texture.cpp
+index 0e5b4bd..49a9f6a 100644
+--- a/src/dxmt/dxmt_texture.cpp
++++ b/src/dxmt/dxmt_texture.cpp
+@@ -47,7 +47,7 @@ TextureView::TextureView(TextureAllocation *allocation, unsigned index, TextureV
+     gpuResourceID(0),
+     allocation(allocation),
+     key(descriptor, index, allocation->descriptor->miplevelCount()) {
+-  auto parent = allocation->texture();
++  auto parent = allocation->texture(descriptor.plane);
+   texture = parent.newTextureView(
+       descriptor.format, descriptor.type, descriptor.firstMiplevel, descriptor.miplevelCount,
+       descriptor.firstArraySlice, descriptor.arraySize,
+@@ -114,6 +114,8 @@ Texture::createView(TextureViewDescriptor const &descriptor) {
+   std::unique_lock<dxmt::shared_mutex> lock(mutex_);
+   unsigned i = 0;
+   for (; i < version_; i++) {
++    if (viewDescriptors_[i].plane != descriptor.plane)
++      continue;
+     if (viewDescriptors_[i].format != descriptor.format)
+       continue;
+     if (viewDescriptors_[i].type != descriptor.type)
+@@ -133,7 +135,8 @@ Texture::createView(TextureViewDescriptor const &descriptor) {
+   return TextureViewKey(descriptor, i, info_.mipmap_level_count);
+ }
+ 
+-Texture::Texture(const WMTTextureInfo &descriptor, WMT::Device device) :
++Texture::Texture(const WMTTextureInfo &descriptor, WMT::Device device, bool planar) :
++    nv12(planar),
+     info_(descriptor),
+     device_(device) {
+ 
+@@ -200,7 +203,14 @@ Texture::allocate(Flags<TextureAllocationFlag> flags) {
+     return new TextureAllocation(this, std::move(buffer), buffer_info.memory.get(), info, bytes_per_row_, flags);
+   }
+   auto texture = flags.test(TextureAllocationFlag::Shared) ? device_.newSharedTexture(info) : device_.newTexture(info);
+-  return new TextureAllocation(this, std::move(texture), info, flags);
++  auto allocation = Rc<TextureAllocation>(new TextureAllocation(this, std::move(texture), info, flags));
++  if (nv12) {
++    info.pixel_format = WMTPixelFormatRG8Unorm;
++    info.width /= 2;
++    info.height /= 2;
++    allocation->uv_ = device_.newTexture(info);
++  }
++  return allocation;
+ }
+ 
+ Rc<TextureAllocation>
+diff --git a/src/dxmt/dxmt_texture.hpp b/src/dxmt/dxmt_texture.hpp
+index ba57499..d0c70d1 100644
+--- a/src/dxmt/dxmt_texture.hpp
++++ b/src/dxmt/dxmt_texture.hpp
+@@ -48,6 +48,7 @@ struct TextureViewDescriptor {
+   uint32_t miplevelCount   : 4 = 1;
+   uint32_t firstArraySlice : 12 = 0;
+   uint32_t arraySize       : 12 = 1;
++  uint32_t plane = 0;
+ };
+ 
+ struct TextureViewKey {
+@@ -136,8 +137,8 @@ class TextureAllocation final : public Allocation {
+ 
+ public:
+ 
+-  WMT::Texture texture() const {
+-    return obj_;
++  WMT::Texture texture(unsigned plane = 0) const {
++    return plane ? uv_ : obj_;
+   }
+ 
+   Flags<TextureAllocationFlag>
+@@ -167,6 +168,7 @@ private:
+   TextureAllocation(TextureAllocation &&) = delete;
+ 
+   WMT::Reference<WMT::Texture> obj_;
++  WMT::Reference<WMT::Texture> uv_;
+   WMT::Reference<WMT::Buffer> buffer_;
+   uint32_t version_ = 0;
+   Flags<TextureAllocationFlag> flags_;
+@@ -235,11 +237,19 @@ public:
+ 
+   unsigned
+   width(TextureViewKey view) {
++    if (nv12) {
++      std::shared_lock<dxmt::shared_mutex> lock(mutex_);
++      return info_.width >> viewDescriptors_[view.index].plane;
++    }
+     return std::max(info_.width >> view.mip_start, 1u);
+   }
+ 
+   unsigned
+   height(TextureViewKey view) {
++    if (nv12) {
++      std::shared_lock<dxmt::shared_mutex> lock(mutex_);
++      return info_.height >> viewDescriptors_[view.index].plane;
++    }
+     return std::max(info_.height >> view.mip_start, 1u);
+   }
+ 
+@@ -273,6 +283,8 @@ public:
+     return info_.mipmap_level_count;
+   }
+ 
++  bool nv12 = false;
++
+   TextureViewKey fullView;
+ 
+   Rc<TextureAllocation> allocate(Flags<TextureAllocationFlag> flags);
+@@ -287,7 +299,7 @@ public:
+ 
+   Rc<TextureAllocation> rename(Rc<TextureAllocation> &&newAllocation);
+ 
+-  Texture(const WMTTextureInfo &info, WMT::Device device);
++  Texture(const WMTTextureInfo &info, WMT::Device device, bool nv12 = false);
+ 
+   Texture(unsigned bytes_per_image, unsigned bytes_per_row, const WMTTextureInfo &info, WMT::Device device);
+ 
+diff --git a/tests/meson.build b/tests/meson.build
+index 1e19e25..d188563 100644
+--- a/tests/meson.build
++++ b/tests/meson.build
+@@ -1 +1,4 @@
++nv12_layout = executable('nv12_layout', 'nv12_layout.cpp', native: true, cpp_args: ['-UNDEBUG'])
++test('NV12 CPU layout', nv12_layout)
++
+ subdir('dx11')
+\ No newline at end of file
+diff --git a/tests/nv12_layout.cpp b/tests/nv12_layout.cpp
+new file mode 100644
+index 0000000..4df523f
+--- /dev/null
++++ b/tests/nv12_layout.cpp
+@@ -0,0 +1,18 @@
++#include "../src/dxmt/dxmt_nv12.hpp"
++#include <cassert>
++#include <cstdio>
++
++int main() {
++  using dxmt::NV12Layout;
++  static_assert(NV12Layout::valid(1920, 1080, 2048));
++  constexpr auto layout = NV12Layout::get(1080, 2048);
++  static_assert(layout.uvOffset == 2211840 && layout.size == 3317760);
++  assert(!NV12Layout::valid(1919, 1080, 2048));
++  assert(!NV12Layout::valid(1920, 1079, 2048));
++  assert(!NV12Layout::valid(1920, 1080, 1919));
++  assert(!NV12Layout::valid(2, 2, UINT32_MAX));
++  assert(!NV12Layout::valid(0, 0, 0));
++  // Last useful UV byte stays inside a padded allocation.
++  assert(layout.uvOffset + (1080 / 2 - 1) * layout.pitch + 1920 <= layout.size);
++  std::puts("NV12 layout checks passed");
++}

@@ -1,0 +1,34 @@
+Render cross-process swapchains into a hidden local window instead of failing. Chromium's GPU process (CEF offscreen
+rendering in vrwebhelper) creates a swapchain for a browser-process window and falls back to software compositing
+when that fails. See DXMT issue #141 for a real cross-process fix.
+
+diff --git a/src/d3d11/d3d11_swapchain.cpp b/src/d3d11/d3d11_swapchain.cpp
+index 86cf466..d42abd7 100644
+--- a/src/d3d11/d3d11_swapchain.cpp
++++ b/src/d3d11/d3d11_swapchain.cpp
+@@ -1107,8 +1107,23 @@ CreateSwapChain(
+   DWORD window_process_id;
+   GetWindowThreadProcessId(hWnd, &window_process_id);
+   if (GetProcessId(GetCurrentProcess()) != window_process_id) {
+-    ERR("CreateSwapChain: cross-process swapchain not supported yet");
+-    return E_FAIL;
++    // Metal views only attach to windows of this process. CEF's offscreen GPU process never presents to the
++    // browser-process window it gets, so use a hidden local one.
++    RECT rc = {};
++    GetClientRect(hWnd, &rc);
++    int width = pDesc->Width ? pDesc->Width : std::max(1L, rc.right - rc.left);
++    int height = pDesc->Height ? pDesc->Height : std::max(1L, rc.bottom - rc.top);
++    HWND local = CreateWindowExW(
++        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"STATIC", L"", WS_POPUP, -30000, -30000, width, height, NULL, NULL,
++        NULL, NULL
++    );
++    if (!local) {
++      ERR("CreateSwapChain: cross-process swapchain fallback window failed");
++      return E_FAIL;
++    }
++    ShowWindow(local, SW_SHOWNOACTIVATE);
++    WARN("CreateSwapChain: cross-process window ", hWnd, " redirected to hidden window ", local);
++    hWnd = local;
+   }
+ 
+   Com<IMTLDXGIDevice> layer_factory;

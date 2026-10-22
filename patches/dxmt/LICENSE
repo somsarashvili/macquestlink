@@ -1,0 +1,15 @@
+The patches in this directory modify DXMT (https://github.com/3Shain/dxmt), which is
+Copyright (c) 2023-2026 Feifan He for CodeWeavers and licensed under the GNU Lesser General Public License,
+version 2.1 or (at your option) any later version.
+
+These patches are derivative works of DXMT and are distributed under the same terms: GNU Lesser General Public
+License, version 2.1 or (at your option) any later version (SPDX: LGPL-2.1-or-later). A copy of the license is in
+COPYING.LIB in this directory.
+
+0001-nv12-from-dxmt-issue-229.patch is based on the NV12 work posted in DXMT issue #229
+(https://github.com/3Shain/dxmt/issues/229, author hadykachmarv-coder), rebased onto DXMT 50102f9.
+The other patches: Copyright (c) 2026 Solo Omsarashvili.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied
+warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Lesser General Public License for more
+details.

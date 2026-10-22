@@ -1,0 +1,28 @@
+Report DXGI usage (IDXGIResource::GetUsage) from bind flags and CPU access instead of 0. ANGLE only wraps D3D11
+textures in EGL images when the usage has SHADER_INPUT/RENDER_TARGET_OUTPUT; without it CEF's GPU process failed
+every offscreen frame ("Unable to initialize SkSurface") and the SteamVR dashboard never got a texture.
+
+diff --git a/src/d3d11/d3d11_resource.hpp b/src/d3d11/d3d11_resource.hpp
+index befa017..da3204a 100644
+--- a/src/d3d11/d3d11_resource.hpp
++++ b/src/d3d11/d3d11_resource.hpp
+@@ -315,7 +315,18 @@ public:
+     if (!pUsage) {
+       return E_INVALIDARG;
+     }
+-    *pUsage = 0;
++    DXGI_USAGE usage = 0;
++    if (desc.BindFlags & D3D11_BIND_SHADER_RESOURCE)
++      usage |= DXGI_USAGE_SHADER_INPUT;
++    if (desc.BindFlags & D3D11_BIND_RENDER_TARGET)
++      usage |= DXGI_USAGE_RENDER_TARGET_OUTPUT;
++    if (desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS)
++      usage |= DXGI_USAGE_UNORDERED_ACCESS;
++    if (desc.Usage == D3D11_USAGE_DYNAMIC)
++      usage |= DXGI_CPU_ACCESS_DYNAMIC;
++    if (desc.Usage == D3D11_USAGE_STAGING)
++      usage |= (desc.CPUAccessFlags & D3D11_CPU_ACCESS_WRITE) ? DXGI_CPU_ACCESS_READ_WRITE : DXGI_CPU_ACCESS_SCRATCH;
++    *pUsage = usage;
+     return S_OK;
+   }
+ 

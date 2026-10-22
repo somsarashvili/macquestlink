@@ -1,0 +1,60 @@
+Timestamp queries: commit at each timestamp and order its command buffer after earlier ones, so gpuEndTime brackets the work; timestamps from a command list are taken after its work, and ExecuteCommandList no longer drops a pending flush (timestamps around an executed command list read 0)
+
+diff --git a/src/d3d11/d3d11_context_imm.cpp b/src/d3d11/d3d11_context_imm.cpp
+index 673ce28..4b4c3d4 100644
+--- a/src/d3d11/d3d11_context_imm.cpp
++++ b/src/d3d11/d3d11_context_imm.cpp
+@@ -382,7 +382,7 @@ public:
+         EmitOP([query = Rc(query)](ArgumentEncodingContext &enc) mutable {
+           enc.sampleTimestamp(std::move(query));
+         });
+-        promote_flush = true;
++        Commit();
+       }
+       break;
+     }
+@@ -523,7 +523,7 @@ public:
+     Com<MTLD3D11CommandList, false> cmdlist = static_cast<MTLD3D11CommandList *>(pCommandList);
+     auto seq_id = ctx_state.cmd_queue.CurrentSeqId();
+ 
+-    promote_flush = cmdlist->promote_flush;
++    promote_flush |= cmdlist->promote_flush;
+ 
+     auto query_list = AllocateCommandData<Rc<VisibilityResultQuery>>(cmdlist->visibility_query_count);
+     for (const auto &[query, index] : cmdlist->issued_visibility_query) {
+@@ -535,10 +535,6 @@ public:
+       End(query.ptr());
+     }
+ 
+-    for (const auto &query : cmdlist->issued_timestamp_query) {
+-      End(query.ptr());
+-    }
+-
+     for (const auto &staging : cmdlist->read_staging_resources) {
+       staging->useCopySource(seq_id);
+     }
+@@ -566,6 +562,10 @@ public:
+       enc.popDeferredVisibilityQueries();
+     });
+ 
++    for (const auto &query : static_cast<MTLD3D11CommandList *>(pCommandList)->issued_timestamp_query) {
++      End(query.ptr());
++    }
++
+     if (RestoreContextState)
+       RestoreEncodingContextState();
+     else
+diff --git a/src/dxmt/dxmt_context.cpp b/src/dxmt/dxmt_context.cpp
+index 7b29f1e..52a6150 100644
+--- a/src/dxmt/dxmt_context.cpp
++++ b/src/dxmt/dxmt_context.cpp
+@@ -1247,7 +1247,8 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
+         encoder.endEncoding();
+ 
+       } else {
+-        // Use timestamp from command buffer's `gpuEndTime`
++        // Use timestamp from command buffer's `gpuEndTime`, which must not precede the end of earlier command buffers
++        barrierOnQueue(cmdbuf);
+       }
+       data->~SampleTimestampData();
+       break;

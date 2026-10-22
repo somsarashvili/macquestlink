@@ -1,0 +1,37 @@
+Submit copies into shared textures without keyed mutex right away. vrclient copies D3D11 overlay textures into such a
+texture and never flushes, so the compositor showed uninitialized (magenta) overlays.
+
+diff --git a/src/d3d11/d3d11_context_impl.cpp b/src/d3d11/d3d11_context_impl.cpp
+index 06e8a11..ac70ccd 100644
+--- a/src/d3d11/d3d11_context_impl.cpp
++++ b/src/d3d11/d3d11_context_impl.cpp
+@@ -1150,6 +1150,7 @@ public:
+       break;
+     }
+     }
++    CommitIfShared(Dst);
+   }
+ 
+   void
+@@ -1195,6 +1196,21 @@ public:
+       CopyTexture(TextureCopyCommand(Dst, DstSubresource, DstX, DstY, DstZ, Src, SrcSubresource, pSrcBox));
+       break;
+     }
++    CommitIfShared(Dst);
++  }
++
++  // Other processes read shared textures without a keyed mutex as soon as they like. vrclient copies overlay
++  // textures into one and never flushes, so submit such copies right away.
++  void
++  CommitIfShared(BlitObject &Dst) {
++    if (Dst.Dimension != D3D11_RESOURCE_DIMENSION_TEXTURE2D)
++      return;
++    auto misc = Dst.Texture2DDesc.MiscFlags;
++    if (!(misc & (D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE)) ||
++        (misc & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX))
++      return;
++    promote_flush = true;
++    InvalidateCurrentPass();
+   }
+ 
+   void

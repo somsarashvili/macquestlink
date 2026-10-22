@@ -1,0 +1,20 @@
+D3D11 resources answer D3D10 interfaces (ID3D10Texture2D etc.) only on a device created through d3d10core, as on Windows. SteamVR's vrclient QIs a submitted texture for ID3D10Texture2D first and took D3D11 apps for D3D10, which has no GPU frame timing: Compositor_FrameTiming app GPU was 0 and Alyx's auto-fidelity climbed to the top level.
+
+diff --git a/src/d3d11/d3d11_resource.hpp b/src/d3d11/d3d11_resource.hpp
+index da3204a..f939777 100644
+--- a/src/d3d11/d3d11_resource.hpp
++++ b/src/d3d11/d3d11_resource.hpp
+@@ -263,9 +263,10 @@ public:
+       return S_OK;
+     }
+ 
+-    if (riid == __uuidof(ID3D10DeviceChild) ||
+-        riid == __uuidof(ID3D10Resource) ||
+-        riid == __uuidof(typename tag::D3D10)) {
++    // As on Windows, only resources of a D3D10 device answer D3D10 interfaces (SteamVR checks ID3D10Texture2D first)
++    if ((riid == __uuidof(ID3D10DeviceChild) ||
++         riid == __uuidof(ID3D10Resource) ||
++         riid == __uuidof(typename tag::D3D10)) && this->m_parent->GetDirectXVersion() == 10) {
+       *ppvObject = ref_and_cast<typename tag::D3D10>(&d3d10);
+       return S_OK;
+     }

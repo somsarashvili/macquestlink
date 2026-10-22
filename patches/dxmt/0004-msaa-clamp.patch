@@ -1,0 +1,24 @@
+Clamp unsupported MSAA sample counts (SteamVR/Half-Life: Alyx request 8x; Apple GPUs top out at 4x).
+
+diff --git a/src/d3d11/d3d11_resource_helper.cpp b/src/d3d11/d3d11_resource_helper.cpp
+index ba9a1be..02ec82b 100644
+--- a/src/d3d11/d3d11_resource_helper.cpp
++++ b/src/d3d11/d3d11_resource_helper.cpp
+@@ -454,9 +454,14 @@ CreateMTLTextureDescriptorInternal(
+       }
+     } else {
+       if (SampleCount > 1) {
+-        if (!pDevice->GetMTLDevice().supportsTextureSampleCount(SampleCount)) {
+-          ERR("CreateMTLTextureDescriptorInternal: sample count ", SampleCount,
+-              " is not supported.");
++        // Apple GPUs top out at 4x; apps like SteamVR request 8x without checking quality levels.
++        UINT requested = SampleCount;
++        while (SampleCount > 1 && !pDevice->GetMTLDevice().supportsTextureSampleCount(SampleCount))
++          SampleCount >>= 1;
++        if (SampleCount != requested)
++          WARN("CreateMTLTextureDescriptorInternal: sample count ", requested, " clamped to ", SampleCount);
++        if (SampleCount <= 1) {
++          ERR("CreateMTLTextureDescriptorInternal: sample count ", requested, " is not supported.");
+           return E_INVALIDARG;
+         }
+         if (ArraySize > 1) {

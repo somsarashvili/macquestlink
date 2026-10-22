@@ -1,0 +1,7 @@
+build/
+toolchains/
+third_party/
+local.env
+.DS_Store
+__pycache__/
+dist/

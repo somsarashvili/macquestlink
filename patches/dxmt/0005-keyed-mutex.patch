@@ -1,0 +1,205 @@
+Keyed mutex fixes for cross-process sharing under Wine (SteamVR compositor, vrlink, games):
+- acquire honors its timeout (Wine's D3DKMTAcquireKeyedMutex returns STATUS_TIMEOUT at once) and sleeps on the
+  shared event between attempts instead of busy polling;
+- an importing process waits for the releasing device's GPU work on acquire (consumers that sync on one device and
+  read on another saw stale frames); dxgi.keyedMutexWaitOnAcquire = false turns it off;
+- committed work is drained at process exit so a released frame is not lost.
+
+diff --git a/src/d3d11/d3d11.cpp b/src/d3d11/d3d11.cpp
+index 9d1122c..561e493 100644
+--- a/src/d3d11/d3d11.cpp
++++ b/src/d3d11/d3d11.cpp
+@@ -231,6 +231,8 @@ extern "C" HRESULT __stdcall D3D11On12CreateDevice(
+ #ifdef _WIN32
+ 
+ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {  
++  if (reason == DLL_PROCESS_DETACH && reserved)
++    dxmt::CommandQueue::WaitAllCommittedOnExit();
+   if (reason != DLL_PROCESS_ATTACH)
+     return TRUE;
+ 
+diff --git a/src/dxmt/dxmt_command_queue.cpp b/src/dxmt/dxmt_command_queue.cpp
+index 89ffc37..c782d77 100644
+--- a/src/dxmt/dxmt_command_queue.cpp
++++ b/src/dxmt/dxmt_command_queue.cpp
+@@ -23,11 +23,25 @@
+ #include "util_env.hpp"
+ #include "util_win32_compat.h"
+ #include <atomic>
++#include <mutex>
++#include <set>
+ 
+ #define ASYNC_ENCODING 1
+ 
+ namespace dxmt {
+ 
++static std::mutex g_queues_mutex;
++static std::set<CommandQueue *> g_queues;
++
++// Work that a keyed-mutex release made visible to other processes must reach the GPU even if this process exits
++// right away; Metal drops a dying process's in-flight command buffers.
++void
++CommandQueue::WaitAllCommittedOnExit() {
++  std::lock_guard<std::mutex> lock(g_queues_mutex);
++  for (auto queue : g_queues)
++    queue->event.waitUntilSignaledValue(queue->committed_event_id_.load(), 1000);
++}
++
+ void *
+ CommandChunk::allocate_cpu_heap(size_t size, size_t alignment) {
+   return queue->AllocateCommandData(size, alignment);
+@@ -61,6 +75,10 @@ CommandQueue::CommandQueue(WMT::Device device) :
+     chunk.reset();
+   };
+   event = device.newSharedEvent();
++  {
++    std::lock_guard<std::mutex> lock(g_queues_mutex);
++    g_queues.insert(this);
++  }
+ 
+   std::string env = env::getEnvVar("DXMT_CAPTURE_FRAME");
+ 
+@@ -74,6 +92,10 @@ CommandQueue::CommandQueue(WMT::Device device) :
+ 
+ CommandQueue::~CommandQueue() {
+   TRACE("Destructing command queue");
++  {
++    std::lock_guard<std::mutex> lock(g_queues_mutex);
++    g_queues.erase(this);
++  }
+   stopped.store(true);
+   ready_for_encode++;
+   ready_for_encode.notify_one();
+@@ -159,6 +181,7 @@ CommandQueue::CommitChunkInternal(CommandChunk &chunk, uint64_t seq) {
+   }
+   chunk.encode(chunk.attached_cmdbuf, this->argument_encoding_ctx);
+   cmdbuf.commit();
++  committed_event_id_.store(chunk.chunk_event_id);
+ 
+   ready_for_commit.fetch_add(1, std::memory_order_release);
+   ready_for_commit.notify_one();
+diff --git a/src/dxmt/dxmt_command_queue.hpp b/src/dxmt/dxmt_command_queue.hpp
+index e109af7..85a1a17 100644
+--- a/src/dxmt/dxmt_command_queue.hpp
++++ b/src/dxmt/dxmt_command_queue.hpp
+@@ -164,6 +164,7 @@ private:
+   std::atomic_uint64_t ready_for_commit = 1;
+   std::atomic_uint64_t chunk_ongoing = 0;
+   CpuFence cpu_coherent;
++  std::atomic_uint64_t committed_event_id_ = 0;
+   CpuFence frame_latency_fence_;
+   std::atomic_bool stopped;
+ 
+@@ -212,6 +213,8 @@ public:
+     return &chunks[id % kCommandChunkCount];
+   };
+ 
++  static void WaitAllCommittedOnExit();
++
+   uint64_t
+   CoherentSeqId() {
+     return cpu_coherent.signaledValue();
+diff --git a/src/dxmt/dxmt_keyed_mutex.cpp b/src/dxmt/dxmt_keyed_mutex.cpp
+index 4c03d4d..c47ff1f 100644
+--- a/src/dxmt/dxmt_keyed_mutex.cpp
++++ b/src/dxmt/dxmt_keyed_mutex.cpp
+@@ -18,6 +18,7 @@
+ 
+ #include "dxmt_keyed_mutex.hpp"
+ #include "log/log.hpp"
++#include "config/config.hpp"
+ #include <random>
+ 
+ namespace dxmt {
+@@ -118,9 +119,18 @@ KeyedMutex::import(WMT::Device device, D3DKMT_HANDLE global_kmt) {
+   ret->global_kmt_ = global_kmt;
+   ret->local_kmt_ = open.hKeyedMutex;
+   ret->event_ = device.newSharedEventWithMachPort(mach_port);
++  ret->imported_ = true;
+   return ret;
+ }
+ 
++static uint64_t
++NowUs() {
++  LARGE_INTEGER c, f;
++  QueryPerformanceCounter(&c);
++  QueryPerformanceFrequency(&f);
++  return c.QuadPart * 1000000ull / f.QuadPart;
++}
++
+ HRESULT
+ KeyedMutex::acquire(KeyedMutexAcquire &&func_acquire, uint64_t key, uint32_t milliseconds) {
+   /**
+@@ -135,18 +145,46 @@ KeyedMutex::acquire(KeyedMutexAcquire &&func_acquire, uint64_t key, uint32_t mil
+   acquire.hKeyedMutex = local_kmt_;
+   acquire.Key = key;
+   acquire.pTimeout = &timeout;
+-  timeout.QuadPart = milliseconds * -10000;
+ 
+-  NTSTATUS status = D3DKMTAcquireKeyedMutex(&acquire);
++  // Wine's D3DKMTAcquireKeyedMutex returns STATUS_TIMEOUT immediately while the other side holds the key, so the
++  // requested timeout is honored here. Between attempts, sleep until the holder's release signals the shared event
++  // (briefly yielding after a signal, as the CPU-side release can trail it) instead of busy polling the wineserver.
++  NTSTATUS status;
++  uint64_t deadline = NowUs() + uint64_t(milliseconds) * 1000;
++  uint64_t seen = event_.signaledValue();
++  uint64_t spin_until = 0;
++  for (;;) {
++    status = D3DKMTAcquireKeyedMutex(&acquire);
++    uint64_t now = NowUs();
++    if (status != STATUS_TIMEOUT || now >= deadline)
++      break;
++    if (now < spin_until) {
++      SwitchToThread();
++      continue;
++    }
++    uint64_t remaining_ms = (deadline - now + 999) / 1000;
++    if (event_.waitUntilSignaledValue(seen + 1, remaining_ms < 2 ? remaining_ms : 2)) {
++      seen = event_.signaledValue();
++      spin_until = NowUs() + 500;
++    }
++  }
+   if (status == STATUS_TIMEOUT)
+     return WAIT_TIMEOUT;
+   if (status == STATUS_ABANDONED_WAIT_0)
+     return WAIT_ABANDONED;
+   if (status) {
+-    WARN("KeyedMutex: Failed to acquire keyed mutex.");
++    WARN("KeyedMutex: Failed to acquire keyed mutex, status=", status);
+     return E_FAIL;
+   }
+ 
++  // The GPU-side wait in func_acquire only orders this device. Consumers often acquire on one device just to sync
++  // (SteamVR's sync texture) and then read the shared textures on another device or thread, which Windows orders
++  // implicitly, so a process that opened the mutex waits here until the releasing device's GPU work has completed.
++  // The creating process (a game with its own sync texture) keeps the GPU-side wait only, and with it its CPU/GPU
++  // overlap.
++  static const bool wait_on_acquire = Config::getInstance().getOption<bool>("dxgi.keyedMutexWaitOnAcquire", true);
++  if (wait_on_acquire && imported_)
++    event_.waitUntilSignaledValue(acquire.FenceValue, 100);
+   func_acquire(acquire.FenceValue);
+ 
+   fence_value_ = acquire.FenceValue;
+@@ -169,8 +207,8 @@ KeyedMutex::release(KeyedMutexRelease &&func_release, uint64_t key) {
+   release.Key = key;
+   release.FenceValue = fence_value_ + 1;
+ 
+-  if (D3DKMTReleaseKeyedMutex(&release)) {
+-    WARN("KeyedMutex: Failed to release keyed mutex.");
++  if (NTSTATUS status = D3DKMTReleaseKeyedMutex(&release)) {
++    WARN("KeyedMutex: Failed to release keyed mutex, status=", status);
+     return E_FAIL;
+   }
+ 
+diff --git a/src/dxmt/dxmt_keyed_mutex.hpp b/src/dxmt/dxmt_keyed_mutex.hpp
+index f45ee13..dd6fd09 100644
+--- a/src/dxmt/dxmt_keyed_mutex.hpp
++++ b/src/dxmt/dxmt_keyed_mutex.hpp
+@@ -58,6 +58,7 @@ private:
+   std::atomic<uint32_t> refcount_ = {0u};
+   std::atomic_bool owned_ = false;
+   uint64_t fence_value_ = 0;
++  bool imported_ = false;
+   WMT::Reference<WMT::SharedEvent> event_;
+ };
+ 
