@@ -39,9 +39,9 @@ jobs:
         run: python3 -m py_compile tools/*.py
 
   build:
-    # Apple Silicon runner, same image as DXMT's upstream CI: Xcode 16 / macOS 15 SDK for DXMT's Metal code, Rosetta
-    # for the x86_64 LLVM and meson's x86_64 native toolchain, and the helper is built natively for arm64.
-    runs-on: macos-15
+    # Apple Silicon runner with the macOS 26 SDK (the helper uses macOS 26 VideoToolbox keys); Rosetta runs the x86_64
+    # LLVM and meson's x86_64 native toolchain.
+    runs-on: macos-26
     timeout-minutes: 300
     outputs:
       name: ${{ steps.package.outputs.name }}

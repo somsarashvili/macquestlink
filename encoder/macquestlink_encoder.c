@@ -21,6 +21,9 @@
 
 #include "../common/mql_protocol.h"
 
+// macOS 26 keys by value: build with older SDKs, no missing symbol on older macOS
+#define MQL_KEY_VBVBufferDuration CFSTR("VBVBufferDuration")
+
 struct encoder {
     VTCompressionSessionRef session;
     uint32_t width;
@@ -186,7 +189,7 @@ static void set_vbv(VTCompressionSessionRef s, const mql_frame_request *req)
     double secs = req->vbv_bits && req->bitrate_kbps ? req->vbv_bits / (req->bitrate_kbps * 1000.0) : 1.0 / fps;
     secs = secs < 1.0 / fps ? 1.0 / fps : secs > 0.25 ? 0.25 : secs;
     CFNumberRef n = CFNumberCreate(NULL, kCFNumberDoubleType, &secs);
-    set_prop(s, kVTCompressionPropertyKey_VBVBufferDuration, n);
+    set_prop(s, MQL_KEY_VBVBufferDuration, n);
     CFRelease(n);
 }
 

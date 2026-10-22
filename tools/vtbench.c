@@ -20,6 +20,12 @@
 #include <string.h>
 #include <time.h>
 
+// macOS 26 keys by value: build with older SDKs, no missing symbol on older macOS
+#define MQL_KEY_VBVBufferDuration CFSTR("VBVBufferDuration")
+#define MQL_KEY_VariableBitRate CFSTR("VariableBitRate")
+#define MQL_KEY_VBVMaxBitRate CFSTR("VBVMaxBitRate")
+#define MQL_KEY_VBVInitialDelayPercentage CFSTR("VBVInitialDelayPercentage")
+
 typedef struct {
     VTCompressionSessionRef s;
     dispatch_semaphore_t done;
@@ -96,7 +102,7 @@ static int rate_bps(void)
 static CFStringRef rate_key(void)
 {
     return getenv("CBR") ? kVTCompressionPropertyKey_ConstantBitRate
-         : getenv("VBR") ? kVTCompressionPropertyKey_VariableBitRate
+         : getenv("VBR") ? MQL_KEY_VariableBitRate
                          : kVTCompressionPropertyKey_AverageBitRate;
 }
 
@@ -145,11 +151,11 @@ static void create(bench *b, int lowlat, int speed)
     if (rate_bps())
         set_int(b->s, rate_key(), rate_bps());
     if (getenv("VBVMAX"))
-        set_int(b->s, kVTCompressionPropertyKey_VBVMaxBitRate, atoi(getenv("VBVMAX")) * 1000000);
+        set_int(b->s, MQL_KEY_VBVMaxBitRate, atoi(getenv("VBVMAX")) * 1000000);
     if (getenv("VBVDUR"))
-        set_float(b->s, kVTCompressionPropertyKey_VBVBufferDuration, atof(getenv("VBVDUR")) / g_fps);
+        set_float(b->s, MQL_KEY_VBVBufferDuration, atof(getenv("VBVDUR")) / g_fps);
     if (getenv("VBVINIT"))
-        set_float(b->s, kVTCompressionPropertyKey_VBVInitialDelayPercentage, atof(getenv("VBVINIT")));
+        set_float(b->s, MQL_KEY_VBVInitialDelayPercentage, atof(getenv("VBVINIT")));
     if (getenv("DRL")) {
         double bytes = atof(getenv("DRL")), secs = (getenv("DRLW") ? atof(getenv("DRLW")) : 1) / g_fps;
         CFNumberRef nb = CFNumberCreate(NULL, kCFNumberDoubleType, &bytes), nt = CFNumberCreate(NULL, kCFNumberDoubleType, &secs);
@@ -333,7 +339,7 @@ static void *run(void *arg)
             if (getenv("VBVDUR") && getenv("REVBV")) {
                 double d = atof(getenv("VBVDUR")) / g_fps;
                 CFNumberRef nr = CFNumberCreate(NULL, kCFNumberSInt32Type, &r), nd = CFNumberCreate(NULL, kCFNumberDoubleType, &d);
-                const void *k[] = { rate_key(), kVTCompressionPropertyKey_VBVBufferDuration }, *v[] = { nr, nd };
+                const void *k[] = { rate_key(), MQL_KEY_VBVBufferDuration }, *v[] = { nr, nd };
                 CFDictionaryRef props = CFDictionaryCreate(NULL, k, v, 2, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
                 OSStatus err = VTSessionSetProperties(b->s, props);
                 if (err)
